@@ -24,6 +24,7 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
 
+// Multer configuration: ensure field name matches frontend 'file' key
 const upload = multer({ storage });
 app.use('/uploads', express.static(uploadDir));
 
@@ -64,7 +65,8 @@ const courseSchema = new mongoose.Schema({
 const Course = mongoose.model('Course', courseSchema);
 
 const submissionSchema = new mongoose.Schema({
-  assignmentId: Number,
+  // UPDATED: String type to correctly support MongoDB _id strings
+  assignmentId: String, 
   courseId: Number,
   studentEmail: String, 
   fileName: String,
@@ -74,7 +76,6 @@ const submissionSchema = new mongoose.Schema({
 });
 const Submission = mongoose.model('Submission', submissionSchema);
 
-// UPDATED: Explicit schema for Quiz to ensure 'question' text is saved
 const Quiz = mongoose.model('Quiz', new mongoose.Schema({ 
   courseId: { type: Number, required: true }, 
   title: String, 
@@ -87,9 +88,11 @@ const Quiz = mongoose.model('Quiz', new mongoose.Schema({
 
 const Assignment = mongoose.model('Assignment', new mongoose.Schema({ 
   courseId: { type: Number, required: true }, 
-  id: { type: Number, required: true }, 
+  id: { type: Number }, 
   title: String, 
-  task: String 
+  task: String,
+  details: String, 
+  dueDate: String  
 }));
 
 const Comment = mongoose.model('Comment', new mongoose.Schema({ 
@@ -99,7 +102,13 @@ const Comment = mongoose.model('Comment', new mongoose.Schema({
     name: String, 
     text: String,
     instructorEmail: String,
-    createdAt: { type: Date, default: Date.now } 
+    createdAt: { type: Date, default: Date.now },
+    replies: [{
+      text: String,
+      adminName: String,
+      adminEmail: String,
+      createdAt: { type: Date, default: Date.now }
+    }]
 }));
 
 const Certificate = mongoose.model('Certificate', new mongoose.Schema({
@@ -219,7 +228,6 @@ app.get('/api/user/courses/:email', async (req, res) => {
   } catch (err) { res.status(500).json({ message: "Dashboard failed" }); }
 });
 
-// NEW: Sequential Progress Update Route
 app.post('/api/user/update-progress', async (req, res) => {
   try {
     const { email, courseId, lessonIndex } = req.body;
@@ -275,26 +283,59 @@ app.post('/api/comments', async (req, res) => {
   } catch (err) { res.status(500).json({ message: "Post failed" }); }
 });
 
+app.post('/api/comments/reply', async (req, res) => {
+  try {
+    const { commentId, text, adminName, adminEmail } = req.body;
+    const updatedComment = await Comment.findByIdAndUpdate(
+      commentId,
+      {
+        $push: {
+          replies: {
+            text,
+            adminName,
+            adminEmail: adminEmail.toLowerCase(),
+            createdAt: Date.now()
+          }
+        }
+      },
+      { new: true }
+    );
+    res.status(201).json({ success: true, comment: updatedComment });
+  } catch (err) {
+    res.status(500).json({ message: "Reply failed" });
+  }
+});
+
 /* ================================
-7. ASSIGNMENTS & QUIZZES
+7. ASSIGNMENTS & QUIZZES (FIXED SYNC)
 ================================ */
 
 app.get('/api/user/assignments/:email', async (req, res) => {
   try {
     const email = req.params.email.toLowerCase();
     const user = await User.findOne({ email });
-    const courseIds = user.enrolledCourses.map(c => Number(c.id)).filter(id => !isNaN(id));
-    const assignments = await Assignment.find({ courseId: { $in: courseIds } }).lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const enrolledIds = user.enrolledCourses.map(c => Number(c.id)).filter(id => !isNaN(id));
+    const assignments = await Assignment.find({ courseId: { $in: enrolledIds } }).lean();
+    
     const enriched = await Promise.all(assignments.map(async (asn) => {
+      // Searching by string version of _id to match string-based submission record
       const sub = await Submission.findOne({ 
-          assignmentId: Number(asn.id), 
-          courseId: Number(asn.courseId), 
+          assignmentId: asn._id.toString(), 
           studentEmail: email 
       });
-      return { ...asn, isSubmitted: !!sub, grade: sub ? sub.grade : null };
+      return { 
+        ...asn, 
+        isSubmitted: !!sub, 
+        grade: sub ? sub.grade : null,
+        submittedAt: sub ? sub.submittedAt : null,
+        submittedFileName: sub ? sub.fileName : null 
+      };
     }));
+    
     res.json(enriched);
-  } catch (err) { res.status(500).json({ message: "Sync failed" }); }
+  } catch (err) { res.status(500).json({ message: "Assignment sync failed" }); }
 });
 
 app.get('/api/user/quizzes/:email', async (req, res) => {
@@ -327,14 +368,30 @@ app.post('/api/user/quizzes/submit', async (req, res) => {
 app.post('/api/assignments/submit', upload.single('file'), async (req, res) => {
   try {
     const { assignmentId, courseId, studentEmail } = req.body;
-    if (!req.file) return res.status(400).json({ message: "File required" });
+    
+    if (!req.file) {
+      return res.status(400).json({ message: "Upload failed: Please select a file and ensure key is 'file'." });
+    }
+    
     await Submission.findOneAndUpdate(
-      { assignmentId: Number(assignmentId), courseId: Number(courseId), studentEmail: studentEmail.toLowerCase() },
-      { fileName: req.file.filename, filePath: req.file.path, submittedAt: Date.now() },
-      { upsert: true }
+      { 
+        assignmentId: assignmentId, 
+        studentEmail: studentEmail.toLowerCase() 
+      },
+      { 
+        courseId: Number(courseId),
+        fileName: req.file.filename, 
+        filePath: req.file.path, 
+        submittedAt: Date.now(),
+        grade: null 
+      },
+      { upsert: true, new: true }
     );
-    res.status(201).json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Upload failed" }); }
+    res.status(201).json({ success: true, message: "Assignment uploaded successfully" });
+  } catch (err) { 
+    console.error("Submission error:", err);
+    res.status(500).json({ message: "Server-side upload processing failure." }); 
+  }
 });
 
 /* ================================
@@ -344,52 +401,65 @@ app.post('/api/assignments/submit', upload.single('file'), async (req, res) => {
 app.post('/api/admin/create-course', async (req, res) => {
     try {
       const { title, category, description, instructorEmail, instructorName, quizzes, assignments, lessons } = req.body;
-      
       const lastCourse = await Course.findOne().sort({ id: -1 });
       const nextId = lastCourse ? lastCourse.id + 1 : 101;
 
       const newCourse = new Course({
-        id: nextId,
-        title,
-        category,
-        description,
-        instructor: instructorName,
-        instructorEmail: instructorEmail.toLowerCase(),
-        lessons: lessons || [], 
+        id: nextId, title, category, description, instructor: instructorName,
+        instructorEmail: instructorEmail.toLowerCase(), lessons: lessons || [], 
         color: '#'+Math.floor(Math.random()*16777215).toString(16)
       });
       await newCourse.save();
 
       if (quizzes && quizzes.length > 0) {
-        const newQuiz = new Quiz({
-          courseId: nextId,
-          title: `${title} - Final Assessment`,
-          questions: quizzes 
-        });
-        await newQuiz.save();
+        await new Quiz({ courseId: nextId, title: `${title} - Assessment`, questions: quizzes }).save();
       }
 
       if (assignments && assignments.length > 0) {
         const asgnDocs = assignments.map((a, index) => ({
-          courseId: nextId,
-          id: index + 1,
-          title: a.title,
-          task: a.task
+          courseId: nextId, id: index + 1, title: a.title, task: a.task
         }));
         await Assignment.insertMany(asgnDocs);
       }
-
       res.status(201).json({ success: true, course: newCourse });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: "Full curriculum creation failed" });
-    }
+    } catch (err) { res.status(500).json({ message: "Curriculum creation failed" }); }
+});
+
+// claim an existing course as an instructor
+app.post('/api/admin/claim-course', async (req, res) => {
+  try {
+    const { courseId, newInstructorEmail, newInstructorName } = req.body;
+    
+    await Course.findOneAndUpdate(
+      { id: Number(courseId) },
+      { 
+        instructorEmail: newInstructorEmail.toLowerCase(),
+        instructor: newInstructorName 
+      }
+    );
+    
+    res.json({ success: true, message: "Course claimed successfully" });
+  } catch (err) {
+    res.status(500).json({ message: "Server error while claiming course" });
+  }
+});
+
+app.delete('/api/admin/delete-course/:id', async (req, res) => {
+  try {
+    const cid = Number(req.params.id);
+    await Promise.all([
+      Course.deleteOne({ id: cid }),
+      Quiz.deleteMany({ courseId: cid }),
+      Assignment.deleteMany({ courseId: cid }),
+      Submission.deleteMany({ courseId: cid }),
+      Comment.deleteMany({ courseId: cid })
+    ]);
+    res.json({ success: true, message: "Purged related course records" });
+  } catch (err) { res.status(500).json({ message: "Delete failed." }); }
 });
 
 app.get('/api/admin/courses/:email', async (req, res) => {
-    try { 
-        res.json(await Course.find({ instructorEmail: req.params.email.toLowerCase() })); 
-    } catch (err) { res.status(500).json([]); }
+    try { res.json(await Course.find({ instructorEmail: req.params.email.toLowerCase() })); } catch (err) { res.status(500).json([]); }
 });
 
 app.get('/api/admin/course-stats/:courseId', async (req, res) => {
@@ -403,21 +473,16 @@ app.get('/api/admin/course-stats/:courseId', async (req, res) => {
       const quizCompletion = s.completedQuizzes.find(cq => Number(cq.courseId) === cid);
 
       return {
-        firstName: s.firstName, 
-        lastName: s.lastName, 
-        email: s.email,
+        firstName: s.firstName, lastName: s.lastName, email: s.email,
         progress: s.enrolledCourses.find(c => Number(c.id) === cid)?.progress || 0,
-        quizData: {
-            score: quizCompletion ? quizCompletion.score : null,
-            passed: quizCompletion ? quizCompletion.passed : false
-        },
+        quizData: { score: quizCompletion ? quizCompletion.score : null, passed: quizCompletion ? quizCompletion.passed : false },
         assignments: assignments.map(a => {
-          const sub = subs.find(subm => Number(subm.assignmentId) === a.id);
+          const sub = subs.find(subm => subm.assignmentId === a._id.toString());
           return { 
-            id: a.id, 
-            title: a.title, 
-            fileUrl: sub ? `http://localhost:5001/uploads/${sub.fileName}` : null, 
-            grade: sub ? sub.grade : null 
+             id: a._id, 
+             title: a.title, 
+             fileUrl: sub ? `http://localhost:5001/uploads/${sub.fileName}` : null, 
+             grade: sub ? sub.grade : null 
           };
         })
       };
@@ -431,17 +496,13 @@ app.post('/api/admin/grade-assignment', async (req, res) => {
     const { studentEmail, courseId, assignmentId, grade } = req.body;
     const cid = Number(courseId);
     await Submission.findOneAndUpdate(
-        { studentEmail: studentEmail.toLowerCase(), courseId: cid, assignmentId: Number(assignmentId) }, 
-        { grade: Number(grade) }, 
-        { upsert: true }
+        { studentEmail: studentEmail.toLowerCase(), courseId: cid, assignmentId: assignmentId }, 
+        { grade: Number(grade) }, { upsert: true }
     );
     const total = await Assignment.countDocuments({ courseId: cid });
     const graded = await Submission.countDocuments({ studentEmail: studentEmail.toLowerCase(), courseId: cid, grade: { $ne: null } });
     const newProgress = total > 0 ? Math.round((graded / total) * 100) : 0;
-    await User.updateOne(
-        { email: studentEmail.toLowerCase(), "enrolledCourses.id": cid }, 
-        { $set: { "enrolledCourses.$.progress": newProgress } }
-    );
+    await User.updateOne({ email: studentEmail.toLowerCase(), "enrolledCourses.id": cid }, { $set: { "enrolledCourses.$.progress": newProgress } });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ message: "Grading sync failed" }); }
 });
@@ -449,21 +510,13 @@ app.post('/api/admin/grade-assignment', async (req, res) => {
 app.post('/api/admin/issue-certificate', async (req, res) => {
   try {
     const { studentEmail, studentName, courseId, courseTitle, issuedBy } = req.body;
-    await new Certificate({ 
-        studentEmail: studentEmail.toLowerCase(), 
-        studentName, 
-        courseId: Number(courseId), 
-        courseTitle, 
-        issuedBy 
-    }).save();
+    await new Certificate({ studentEmail: studentEmail.toLowerCase(), studentName, courseId: Number(courseId), courseTitle, issuedBy }).save();
     res.status(201).json({ success: true });
   } catch (err) { res.status(500).json({ message: "Certificate issuance failed" }); }
 });
 
 app.get('/api/user/certificates/:email', async (req, res) => {
-    try { 
-        res.json(await Certificate.find({ studentEmail: req.params.email.toLowerCase() }).sort({ issuedAt: -1 })); 
-    } catch (err) { res.status(500).json([]); }
+    try { res.json(await Certificate.find({ studentEmail: req.params.email.toLowerCase() }).sort({ issuedAt: -1 })); } catch (err) { res.status(500).json([]); }
 });
 
 /* ================================
